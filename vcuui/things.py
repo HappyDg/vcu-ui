@@ -63,7 +63,6 @@ class Things(threading.Thread):
         while True:
             if self.active:
                 next_state = self.state
-                md = self.model.get_all()
 
                 if self.state != 'connected':
                     # Check if we are connected
@@ -77,6 +76,8 @@ class Things(threading.Thread):
                             self._attributes(md)
 
                 elif self.state == 'connected':
+                    md = self.model.get_all()
+
                     # Get gps update every one second
                     self._gnss(md)
 

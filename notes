@@ -32,3 +32,6 @@ python3 -m pip install vcu-ui --upgrade
 
 python3 /usr/bin/ubxtool -p CFG-GNSS -f /dev/gps0 -s 115200 -w 1
 
+
+https://developer.toradex.com/knowledge-base/ostree
+
