@@ -1,234 +1,218 @@
 #!/usr/bin/python3
 
 import binascii
+import logging
 import queue
 import socket
 import struct
 import sys
 import threading
-
-import vcuui.gnss as gnss
-
-"""
-def send(control_msg):
-    ubx_msg = gnss._create_ubx_message(control_msg)
-
-    msg = ''
-    for x in ubx_msg:
-        msg = msg + f'{x:02x}'
-
-    print(msg)
-
-    msg2 = binascii.hexlify(ubx_msg)
-    print(msg2)
-
-    # return
-
-    server_address = '/var/run/gpsd.sock'
-
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    try:
-        sock.connect(server_address)
-
-        # sock.sendall('?devices'.encode())
-        # data = sock.recv(512)
-        # print(data.decode())
-
-        # cmd = '&/dev/ttyS3=' + msg
-        # print(cmd)
-        # sock.send(cmd.encode())
-
-        cmd = '&/dev/ttyS3='.encode() + msg2
-        print(cmd)
-        sock.send(cmd)
-
-        data = sock.recv(512)
-        print(data.decode())
-
-        sock.close()
-
-    except socket.error as msg:
-        print(msg)
-        sys.exit(1)
-"""
-
-def flag_s(flag, descs):
-    """Decode flag using descs, return a string.  Ignores unknown bits."""
-
-    s = ''
-    for key, value in sorted(descs.items()):
-        if key == (key & flag):
-            s += value
-            s += ' '
-
-    return s.strip()
+import time
+from enum import Enum
 
 
-class ubx_decoder:
-    cfg_prt_flags = {
-        0x2: 'extendedTxTimeout',
-    }
-
-    cfg_prt_proto = {
-        0x1: 'UBX',
-        0x2: 'NMEA',
-        0x4: 'RTCM2',
-        0x20: 'RTCM3',
-    }
-
-    # Names for portID values in UBX-CFG-PRT, UBX-MON-IO, etc.
-    port_ids = {0: 'DDC',  # The inappropriate name for i2c used in the spec
-                1: 'UART1',
-                2: 'UART2',
-                3: 'USB',
-                4: 'SPI',
-                }
-
-    def cfg_prt(self, buf):
-        """UBX-CFG-PRT decode"""
-
-        m_len = len(buf)
-        if 0 == m_len:
-            return " Poll request"
-
-        portid = buf[0]
-        idstr = '%u (%s)' % (portid, self.port_ids.get(portid, '?'))
-
-        if 1 == m_len:
-            return " Poll request PortID %s" % idstr
-
-        # Note that this message can contain multiple 20-byte submessages, but
-        # only in the send direction, which we don't currently do.
-        if 20 > m_len:
-            return "Bad Length %s" % m_len
-
-        u = struct.unpack_from('<BBHLLHHHH', buf, 0)
-
-        s = [' PortID %s reserved1 %u txReady %#x' % (idstr, u[1], u[2])]
-        s.append({1: '  mode %#x baudRate %u',
-                  2: '  mode %#x baudRate %u',
-                  3: '  reserved2 [%u %u]',
-                  4: '  mode %#x reserved2 %u',
-                  0: '  mode %#x reserved2 %u',
-                  }.get(portid, '  ???: %u,%u') % tuple(u[3:5]))
-        s.append('  inProtoMask %#x outProtoMask %#x' % tuple(u[5:7]))
-        s.append({1: '  flags %#x reserved2 %u',
-                  2: '  flags %#x reserved2 %u',
-                  3: '  reserved3 %u reserved4 %u',
-                  4: '  flags %#x reserved3 %u',
-                  0: '  flags %#x reserved3 %u',
-                  }.get(portid, '  ??? %u,%u') % tuple(u[7:]))
-
-        if portid == 0:
-            s.append('    slaveAddr %#x' % (u[3] >> 1 & 0x7F))
-
-        s.append('    inProtoMask (%s)\n'
-                 '    outProtoMask (%s)' %
-                 (flag_s(u[5], self.cfg_prt_proto),
-                  flag_s(u[6], self.cfg_prt_proto)))
-
-        if portid in set([1, 2, 4, 0]):
-            s.append('    flags (%s)' % flag_s(u[7], self.cfg_prt_flags))
-
-        return '\n'.join(s)
-
-    def nav_status(self, buf):
-        """UBX-NAV-STATUS decode"""
-        m_len = len(buf)
-        if 0 == m_len:
-            return " Poll request"
-
-        if 16 > m_len:
-            return " Bad Length %s" % m_len
-
-        u = struct.unpack_from('<LBBBBLL', buf, 0)
-        return ('  iTOW:%d ms, fix:%d flags:%#x fixstat:%#x flags2:%#x\n'
-                '  ttff:%d, msss:%d' % u)
-
-    def sos_poll(self, buf):
-        m_len = len(buf)
-        print(f'UPD-SPS: {m_len}, {buf[4]}')
+FORMAT = '%(asctime)-15s %(levelname)-8s %(message)s'
+logging.basicConfig(format=FORMAT)
+logger = logging.getLogger('gnss_tool')
+logger.setLevel(logging.DEBUG)
 
 
-class Parser():
+class UbxFrame(object):
+    SYNC_1 = 0xb5
+    SYNC_2 = 0x62
+
+    # @classmethod
+    # def _create(cls, id, msg):
+    #     frame = UbxFrame(cls, id, msg)
+
+    def __init__(self, cls, id, length, msg):
+        super().__init__()
+        self.cls = cls
+        self.id = id
+        self.length = length
+        # print(self.length)
+        self.msg = msg
+        # print(self.msg)
+        # print(len(self.msg))
+        assert self.length == len(self.msg)
+        # TODO: checksum as 16 bit integer?
+        self._calc_checksum()
+        # print(self.cka, self.ckb)
+
+    def is_class_id(self, cls, id):
+        return cls == self.cls and id == self.id
+
+    def to_bytes(self):
+        assert self.cka != -1 and self.ckb != -1
+        # TODO: use SYNC_1, SYNC_2
+        msg = bytearray(b'\xb5\x62')
+        msg.append(self.cls)
+        msg.append(self.id)
+        msg.append((self.length >> 0) % 0xFF)
+        msg.append((self.length >> 8) % 0xFF)
+        msg += self.msg
+        msg.append(self.cka)
+        msg.append(self.ckb)
+
+        return msg
+
+    def _calc_checksum(self):
+        self._init_checksum()
+
+        self._add_checksum(self.cls)
+        self._add_checksum(self.id)
+        self._add_checksum((self.length >> 0) % 0xFF)
+        self._add_checksum((self.length >> 8) % 0xFF)
+        for d in self.msg:
+            self._add_checksum(d)
+
+    def _init_checksum(self):
+        self.cka = 0
+        self.ckb = 0
+
+    def _add_checksum(self, byte):
+        self.cka += byte
+        self.cka &= 0xFF
+        self.ckb += self.cka
+        self.ckb &= 0xFF
+
+    def __str__(self):
+        return f'UBX: cls:{self.cls:02x} id:{self.id:02x} len:{self.length}'
+
+
+class UbxUpdSos(UbxFrame):
+    def __init__(self, ubx_frame):
+        super().__init__(ubx_frame.cls, ubx_frame.id, ubx_frame.length, ubx_frame.msg)
+        if ubx_frame.length == 8 and ubx_frame.msg[0] == 3:
+            self.cmd = ubx_frame.msg[0]
+            self.response = ubx_frame.msg[4]
+        else:
+            self.cmd = -1
+            self.response = -1
+
+    def __str__(self):
+        return f'UBX-UPD-SOS: cmd:{self.cmd}, response:{self.response}'
+
+
+# TODO: Inner class of UbxParser
+class State(Enum):
+    init = 1
+    sync = 2
+    cls = 3
+    id = 4
+    len1 = 5
+    len2 = 6
+    data = 7
+    crc1 = 8
+    crc2 = 9
+
+
+class UbxParser(object):
     def __init__(self, queue):
         super().__init__()
 
         self.queue = queue
-        self.decoder = ubx_decoder()
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        # self.f = open('log.txt', 'w')
+        self.state = State.init
 
-    def listen(self):
-        try:
-            self.sock.connect(('127.0.0.1', 2947))
+        self.msg_class = 0
+        self.msg_id = 0
+        self.msg_len = 0
+        self.msg_data = bytearray()
+        self.ofs = 0
+        self.cka = 0
+        self.ckb = 0
 
-            gpsd_client_raw = '?WATCH={"device":"/dev/ttyS3","enable":true,"raw":2}'
-            self.sock.send(gpsd_client_raw.encode())
+    def process(self, data):
+        # print(data)
+        for d in data:
+            # x = f's: {state}: {d:02x}\n'
+            # self.f.write(x)
 
-            state = 'init'
+            if self.state == State.init:
+                if d == UbxFrame.SYNC_1:
+                    self.state = State.sync
 
-            while True:
-                data = self.sock.recv(32768)
-                # print(binascii.hexlify(data))
+            elif self.state == State.sync:
+                if d == UbxFrame.SYNC_2:
+                    self._reset()
+#                    self.msg_class = 0
+#                    self.msg_id = 0
+#                    self.msg_len = 0
+#                    self.msg_data = bytearray()
+#                    self.cka = 0
+#                    self.ckb = 0
 
-                for d in data:
-                    # x = f's: {state}: {d:02x}\n'
-                    # self.f.write(x)
+                    self.state = State.cls
+                else:
+                    self.state = State.init
 
-                    if state == 'init':
-                        if d == 0xb5:
-                            state = 'sync'
-                    elif state == 'sync':
-                        if d == 0x62:
-                            msg_class = 0
-                            msg_id = 0
-                            msg_len = 0
-                            msg_data = bytearray()
-                            ofs = 0
-                            state = 'class'
-                        else:
-                            state = 'init'
-                    elif state == 'class':
-                        msg_class = d
-                        # print(f'class {msg_class}')
-                        state = 'id'
-                    elif state == 'id':
-                        msg_id = d
-                        # print(f'id {msg_id}')
-                        state = 'len1'
-                    elif state == 'len1':
-                        msg_len = d
-                        state = 'len2'
-                    elif state == 'len2':
-                        msg_len = msg_len + (d * 256)
-                        # print(f'msg len is {msg_len}')
-                        state = 'data'
-                    elif state == 'data':
-                        msg_data.append(d)
-                        ofs += 1
-                        if ofs == msg_len:
-                            state = 'crc1'
-                    elif state == 'crc1':
-                        state = 'crc2'
-                    elif state == 'crc2':
-                        self.process(msg_class, msg_id, msg_data)
+            elif self.state == State.cls:
+                self.msg_class = d
+                self.state = State.id
 
-                        msg_class = 0
-                        msg_id = 0
-                        msg_len = 0
-                        msg_data = bytearray()
+            elif self.state == State.id:
+                self.msg_id = d
+                self.state = State.len1
 
-                        state = 'init'
+            elif self.state == State.len1:
+                self.msg_len = d
+                self.state = State.len2
 
-        except socket.error as msg:
-            print(msg)
+            elif self.state == State.len2:
+                self.msg_len = self.msg_len + (d * 256)
+                # TODO: Handle case with len = 0 -> goto CRC directly
+                self.ofs = 0
+                self.state = State.data
 
-    # TODO: rename cls, class UbxFrame ?
-    def process(self, cls, id, msg):
-        # print(f'frame {cls:02x} {id:02x} {len(msg)}')
+            elif self.state == State.data:
+                self.msg_data.append(d)
+                self.ofs += 1
+                if self.ofs == self.msg_len:
+                    self.state = State.crc1
+
+            elif self.state == State.crc1:
+                self.cka = d
+                self.state = State.crc2
+
+            elif self.state == State.crc2:
+                self.ckb = d
+
+                # Build frame from received data. This will compute the checksum
+                #print(self.cka, self.ckb)
+                frame = UbxFrame(self.msg_class, self.msg_id, self.msg_len, self.msg_data)
+                #print(binascii.hexlify(frame.to_bytes()))
+                #print(frame.cka, frame.ckb)
+#                self.parse_frame(frame)
+
+                if frame.cka == self.cka and frame.ckb == self.ckb:
+                    self.parse_frame(frame)
+                else:
+                    logger.warning(f'checksum error in frame')
+
+                self._reset()
+                self.state = State.init
+
+    def _reset(self):
+        self.msg_class = 0
+        self.msg_id = 0
+        self.msg_len = 0
+        self.msg_data = bytearray()
+        self.cka = 0
+        self.ckb = 0
+        self.ofs = 0
+
+    def parse_frame(self, ubx_frame):
+        # logger.debug(f'frame {cls:02x} {id:02x} {len(msg)} {binascii.hexlify(msg)}')
         # self.f.write(f'frame {cls:02x} {id:02x} {len(msg)}\n')
 
+        if ubx_frame.is_class_id(0x09, 0x14):
+            logger.debug(f'UBX-UPD-SOS: {binascii.hexlify(ubx_frame.to_bytes())}')
+            frame = UbxUpdSos(ubx_frame)
+            self.queue.put(frame)
+        else:
+            self.queue.put(ubx_frame)
+
+        """
         if cls == 0x06 and id == 0x00:
             # print(binascii.hexlify(msg))
             decoded = self.decoder.cfg_prt(msg)
@@ -238,122 +222,179 @@ class Parser():
             decoded = self.decoder.nav_status(msg)
             print(decoded)
         elif cls == 0x09 and id == 0x14:
-            print(binascii.hexlify(msg))
-            # decoded = self.decoder.nav_status(msg)
-            # print(decoded)
-            self.decoder.sos_poll(msg)
-            self.queue.put((cls, id))
-            # self.queue.put(1)
+            logger.debug(f'UBX-UPD-SOS: {binascii.hexlify(msg)}')
+            frame = UbxUpdSos(cls, id, msg)
+            self.queue.put(frame)
+        """
 
 
 class GnssUBlox(threading.Thread):
-    server_address = '/var/run/gpsd.sock'
+    gpsd_control_socket = '/var/run/gpsd.sock'
+    gpsd_data_socket = ('127.0.0.1', 2947)
 
-    def __init__(self):
+    def __init__(self, device_name):
         super().__init__()
 
-        self.daemon = True
+        self.device_name = device_name
+        self.cmd_header = f'&{self.device_name}='.encode()
+        self.connect_msg = f'?WATCH={{"device":"{self.device_name}","enable":true,"raw":2}}'.encode()
 
-        self.queue = queue.Queue()
-
-        self.parser = Parser(self.queue)
-        self.sock = None
-        # self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.listen_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.response_queue = queue.Queue()
+        self.parser = UbxParser(self.response_queue)
+        self.thread_ready_event = threading.Event()
+        self.thread_stop_event = threading.Event()
 
         self.wait_msg_class = -1
         self.wait_msg_id = -1
+        # self.f = open('log.txt', 'w')
 
     def setup(self):
-        #try:
-        #    self.sock.connect(GnssUBlox.server_address)
-        #    self.sock.sendall('?devices'.encode())
-        #    data = self.sock.recv(512)
-        #    print(data.decode())
-        #except socket.error as msg:
-        #    print(msg)
-
+        # Start worker thread in daemon mode, will invoke run() method
+        self.daemon = True
         self.start()
 
+        # Wait for worker thread to become ready.
+        # Without this wait we might send the command before the thread can
+        # handle the response.
+        logger.info('waiting for receive thread to become active')
+        self.thread_ready_event.wait()
+
+    def cleanup(self):
+        logger.info('requesting thread to stop')
+        self.thread_stop_event.set()
+
+        # Wait until thread ended
+        self.join(timeout=1.0)
+        logger.info('thread stopped')
+
     def wait_for(self, msg_class, msg_id):
+        """
+        Define message message to wait for
+        """
         self.wait_msg_class = msg_class
         self.wait_msg_id = msg_id
 
-    def send(self, control_msg):
-        ubx_msg = self._create_ubx_message(control_msg)
-        msg = binascii.hexlify(ubx_msg)
-        print(msg)
-
-        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    def send(self, ubx_message):
         try:
-            self.sock.connect(GnssUBlox.server_address)
+            self.control_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.control_sock.connect(GnssUBlox.gpsd_control_socket)
 
             # sock.sendall('?devices'.encode())
             # data = sock.recv(512)
             # print(data.decode())
 
-            # cmd = '&/dev/ttyS3=' + msg
-            # print(cmd)
-            # sock.send(cmd.encode())
+            msg_in_binary = ubx_message.to_bytes()
+            msg_in_ascii = binascii.hexlify(msg_in_binary)
+            # logger.debug(f'sending {msg_in_ascii}')
 
-            cmd = '&/dev/ttyS3='.encode() + msg
-            # print(cmd)
-            self.sock.send(cmd)
+            cmd = self.cmd_header + msg_in_ascii
+            logger.debug(f'sending control message {cmd}')
+            self.control_sock.sendall(cmd)
 
-            # data = self.sock.recv(512)
-            # print(data.decode())
+            # checking for response (OK or ERROR)
+            data = self.control_sock.recv(512)
+            response = data.decode().strip()
+            logger.debug(f'response: {response}')
 
-            self.sock.close()
+            # TODO: check why we need to close socket here...
+            self.control_sock.close()
 
-        except socket.error as msg:
-            print(msg)
+        except socket.error as msg_in_ascii:
+            logger.error(msg_in_ascii)
 
-    def wait(self, timeout=5.0):
-        try:
-            res = self.queue.get(True, timeout)
-            print(f'got response {res}')
-        except queue.Empty:
-            pass
+    def wait(self, timeout=3.0):
+        logger.info(f'waiting {timeout}s for reponse from listener thread')
+
+        time_end = time.time() + timeout
+        while time.time() < time_end:
+            try:
+                res = self.response_queue.get(True, timeout)
+                logger.info(f'got response {res}')
+                if isinstance(res, UbxFrame):
+                    if res.cls == self.wait_msg_class and res.id == self.wait_msg_id:
+                        return res
+            except queue.Empty:
+                logger.warning('timeout...')
 
     def run(self):
-        self.parser.listen()
+        """
+        Thread running method
 
-    def _create_ubx_message(self, data):
-        cka, ckb = self._calc_checksum(data)
-        msg = bytearray(b'\xb5\x62') + data
-        msg.append(cka)
-        msg.append(ckb)
-        return msg
+        - receives raw data from gpsd
+        - parses ubx frames, decodes them
+        - if a frame is received it is put in the receive queue
+        """
+        try:
+            logger.info('connecting to gpsd')
+            self.listen_sock.connect(('127.0.0.1', 2947))
+        except socket.error as msg:
+            logger.error(msg)
+            # TODO: Error handling
 
-    def _calc_checksum(self, data):
-        cka, ckb = 0, 0
-        # ckb = 0
+        try:
+            logger.debug('starting raw listener on gpsd')
+            self.listen_sock.send(self.connect_msg)
+            self.listen_sock.settimeout(0.25)
 
-        for byte in data:
-            cka += byte
-            cka &= 0xFF
-            ckb += cka
-            ckb &= 0xFF
+            logger.debug('receiver ready')
+            self.thread_ready_event.set()
 
-        return cka, ckb
+            while not self.thread_stop_event.is_set():
+                try:
+                    data = self.listen_sock.recv(8192)
+                    if data:
+                        self.parser.process(data)
+                except socket.timeout:
+                    pass
+
+        except socket.error as msg:
+            print("error")
+            logger.error(msg)
+
+        logger.debug('receiver done')
 
 
 msg_stop = bytearray.fromhex('06 04 04 00 00 00 08 00')    # stop
 msg_cold_start = bytearray.fromhex('06 04 04 00 FF FF 01 00')  # Cold Start
 msg_mon_ver = bytearray.fromhex('0A 04 00 00')  # MON-VER
-msg_cfg_port_poll = bytearray.fromhex('06 00 01 00 01')  # UBX-CFG-PRT poll 
+msg_cfg_port_poll = bytearray.fromhex('06 00 01 00 01')  # UBX-CFG-PRT poll
 msg_nav_status_poll = bytearray.fromhex('01 03 00 00')
 
 # msg_cfg_port_uart_9600 = bytearray.fromhex('06 00 14 00 01 00 00 00 c0 08 00 00 80 25 00 00 07 00 01 00 00 00 00 00')
 msg_cfg_port_uart_115200 = bytearray.fromhex('06 00 14 00 01 00 00 00 c0 08 00 00 00 c2 01 00 07 00 01 00 00 00 00 00')
 
-msg_upd_sos_poll = bytearray.fromhex('09 14 00 00')
 msg_upd_sos_save = bytearray.fromhex('09 14 04 00 00 00 00 00')
 msg_upd_sos_clear = bytearray.fromhex('09 14 04 00 01 00 00 00')
 
-r = GnssUBlox()
+# b'b562091400001d60'
+#   b562091400001d26
+msg_upd_sos_poll = UbxFrame(0x09, 0x14, 0, bytearray())
+print(msg_upd_sos_poll)
+print(msg_upd_sos_poll.cka)
+print(msg_upd_sos_poll.ckb)
+print(binascii.hexlify(msg_upd_sos_poll.to_bytes()))
+
+# 01 06 3400 10ae510e50ecffff2f0803df154c921990f594033c2cd01bcd000000feffffff01000000feffffff160000009f00020c7e923d02 c8 e0
+x = UbxFrame(0x01, 0x06, 0x34, bytearray.fromhex('10ae510e50ecffff2f0803df154c921990f594033c2cd01bcd000000feffffff01000000feffffff160000009f00020c7e923d02'))
+print(x)
+print(f'{x.cka:02x}')
+print(f'{x.ckb:02x}')
+#quit()
+
+r = GnssUBlox('/dev/ttyS3')
 r.setup()
 
-r.wait_for(0x09, 0x14)
-r.send(msg_upd_sos_poll)
+for i in range(0, 2):
+    # TODO: combine method, because response frame has same class/id as polling message
+    r.wait_for(0x09, 0x14)
+    r.send(msg_upd_sos_poll)
 
-r.wait(2.0)
+    res = r.wait()
+    assert(res)
+    if res:
+        print(f'SOS state is {res.response}')
+
+    time.sleep(0.87)
+
+r.cleanup()
