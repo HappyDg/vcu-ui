@@ -14,7 +14,7 @@ from enum import Enum
 FORMAT = '%(asctime)-15s %(levelname)-8s %(message)s'
 logging.basicConfig(format=FORMAT)
 logger = logging.getLogger('gnss_tool')
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)
 
 
 class UbxFrame(object):
@@ -25,13 +25,13 @@ class UbxFrame(object):
     def CLASS_ID(cls):
         return cls.CLASS, cls.ID
 
-    def __init__(self, cls, id, length=0, msg=bytearray()):
+    def __init__(self, cls, id, length=0, data=bytearray()):
         super().__init__()
         self.cls = cls
         self.id = id
         self.length = length
-        self.msg = msg
-        assert self.length == len(self.msg)
+        self.data = data
+        assert self.length == len(self.data)
         self._calc_checksum()
 
     def is_class_id(self, cls, id):
@@ -43,7 +43,7 @@ class UbxFrame(object):
         msg.append(self.id)
         msg.append((self.length >> 0) % 0xFF)
         msg.append((self.length >> 8) % 0xFF)
-        msg += self.msg
+        msg += self.data
         msg.append(self.cka)
         msg.append(self.ckb)
 
@@ -56,7 +56,7 @@ class UbxFrame(object):
         self._add_checksum(self.id)
         self._add_checksum((self.length >> 0) & 0xFF)
         self._add_checksum((self.length >> 8) & 0xFF)
-        for d in self.msg:
+        for d in self.data:
             self._add_checksum(d)
 
     def _init_checksum(self):
@@ -74,6 +74,11 @@ class UbxFrame(object):
 
 
 class UbxPoll(UbxFrame):
+    """
+    Base class for a polling frame.
+
+    Create by specifying u-blox message class and id.
+    """
     def __init__(self, cls, id):
         super().__init__(cls, id)
 
@@ -82,11 +87,11 @@ class UbxUpdSos(UbxFrame):
     CLASS = 0x09
     ID = 0x14
 
-    def __init__(self, ubx_frame):
-        super().__init__(ubx_frame.cls, ubx_frame.id, ubx_frame.length, ubx_frame.msg)
-        if ubx_frame.length == 8 and ubx_frame.msg[0] == 3:
-            self.cmd = ubx_frame.msg[0]
-            self.response = ubx_frame.msg[4]
+    def __init__(self, msg):
+        super().__init__(msg.cls, msg.id, msg.length, msg.data)
+        if msg.length == 8 and msg.data[0] == 3:
+            self.cmd = msg.data[0]
+            self.response = msg.data[4]
         else:
             self.cmd = -1
             self.response = -1
@@ -95,14 +100,35 @@ class UbxUpdSos(UbxFrame):
         return f'UBX-UPD-SOS: cmd:{self.cmd}, response:{self.response}'
 
 
+class UbxUpdSosAction(UbxFrame):
+    CLASS = 0x09
+    ID = 0x14
+
+    # msg_upd_sos_save = bytearray.fromhex('09 14 04 00 00 00 00 00')
+    # msg_upd_sos_clear = bytearray.fromhex('09 14 04 00 01 00 00 00')
+    def __init__(self, action):
+        msg = bytearray.fromhex('01 00 00 00')
+        super().__init__(self.CLASS, self.ID, 4, msg)
+
+
 class UbxCfgTp5(UbxFrame):
     CLASS = 0x06
     ID = 0x31
 
-    def __init__(self, ubx_frame):
-        super().__init__(ubx_frame.cls, ubx_frame.id, ubx_frame.length, ubx_frame.msg)
-        if ubx_frame.length == 32:
-            pass
+    def __init__(self, msg):
+        super().__init__(msg.cls, msg.id, msg.length, msg.data)
+        if msg.length == 32:
+            tpIdx, version, res1, antCableDelay, rfGroupDelay = struct.unpack('BBhhh', msg.data[0:8])
+            print(tpIdx, version, antCableDelay, rfGroupDelay)
+
+            freqPeriod, freqPeriodLock, pulseLenRatio, pulseLenRatioLock = struct.unpack('<IIII', msg.data[8:24])
+            print(freqPeriod, freqPeriodLock, pulseLenRatio, pulseLenRatioLock)
+
+            userConfigDelay = struct.unpack('<I', msg.data[24:28])
+            print(userConfigDelay)
+
+            flags = struct.unpack('<I', msg.data[24:28])
+            print(flags)
         else:
             pass
 
@@ -120,8 +146,11 @@ class UbxParser(object):
 
     TODO: Do more elaborate parsing to filter out such data in advance
     """
-    # TODO: Inner class of UbxParser
+
     class State(Enum):
+        """
+        Parser states
+        """
         init = 1
         sync = 2
         cls = 3
@@ -264,6 +293,29 @@ class GnssUBlox(threading.Thread):
         self.join(timeout=1.0)
         logger.info('thread stopped')
 
+    def sos_state(self):
+        logger.debug('getting SOS state')
+        msg_upd_sos_poll = UbxPoll(*UbxUpdSos.CLASS_ID())
+        res = r.poll(msg_upd_sos_poll)
+        if res:
+            return res.response
+
+    def sos_create_backup(self):
+        pass
+
+    def sos_remove_backup(self):
+        logger.debug('removing state backup file')
+
+        msg = UbxUpdSosAction(0)
+        print(msg.to_bytes())
+
+        self.expect(0x05, 0x00)
+        self.send(msg)
+        self.wait()
+
+#msg_upd_sos_save = bytearray.fromhex('09 14 04 00 00 00 00 00')
+#msg_upd_sos_clear = bytearray.fromhex('09 14 04 00 01 00 00 00')
+
     def poll(self, message):
         """
         Poll a receiver status
@@ -274,13 +326,13 @@ class GnssUBlox(threading.Thread):
         assert isinstance(message, UbxFrame)
         assert message.length == 0      # poll message have no payload
 
-        self.wait_for(message.cls, message.id)
+        self.expect(message.cls, message.id)
         self.send(message)
         res = self.wait()
 
         return res
 
-    def wait_for(self, msg_class, msg_id):
+    def expect(self, msg_class, msg_id):
         """
         Define message message to wait for
         """
@@ -381,17 +433,21 @@ msg_upd_sos_clear = bytearray.fromhex('09 14 04 00 01 00 00 00')
 r = GnssUBlox('/dev/ttyS3')
 r.setup()
 
-for i in range(0, 2):
-    msg_upd_sos_poll = UbxPoll(*UbxUpdSos.CLASS_ID())
-    res = r.poll(msg_upd_sos_poll)
-    assert(res)
-    if res:
-        print(f'SOS state is {res.response}')
+r.sos_remove_backup()
+#quit()
 
-    msg_upd_tp5_poll = UbxFrame(*UbxCfgTp5.CLASS_ID())
-    res = r.poll(msg_upd_tp5_poll)
-    print(res)
+for i in range(0, 1):
+    print(f'***** {i} ***********************')
+    response = r.sos_state()
+    if response:
+        print(f'SOS state is {response}')
+
+    #msg_upd_tp5_poll = UbxFrame(*UbxCfgTp5.CLASS_ID())
+    #res = r.poll(msg_upd_tp5_poll)
+    #print(res)
 
     time.sleep(0.87)
 
 r.cleanup()
+
+
