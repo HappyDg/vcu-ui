@@ -5,7 +5,6 @@ import logging
 import queue
 import socket
 import struct
-import sys
 import threading
 import time
 from enum import Enum
@@ -17,30 +16,65 @@ logger = logging.getLogger('gnss_tool')
 logger.setLevel(logging.DEBUG)
 
 
+class ClsMsgId(object):
+    """
+    Class and Msg Id
+
+    All UBX messages are identified by their message class and id. 
+    This class models the message identifiers.
+    """
+    def __init__(self, clsId, msgId):
+        self.clsId = clsId
+        self.msgId = msgId
+
+    def __eq__(self, other):
+        return self.clsId == other.clsId and self.msgId == other.msgId
+
+    def __str__(self):
+        return f'clsId:{self.clsId:02x} msgId:{self.msgId:02x}'
+
+
+class UbxMessage(Enum):
+    """
+    Messages (class, id) known by this module
+    """
+    ACK_ACK = ClsMsgId(0x05, 0x01)
+    ACK_NAK = ClsMsgId(0x05, 0x00)
+
+    CFG_TP5 = ClsMsgId(0x06, 0x31)
+
+    UPD_SOS = ClsMsgId(0x09, 0x14)
+    MON_VER = ClsMsgId(0x0a, 0x04)
+
+
 class UbxFrame(object):
     SYNC_1 = 0xb5
     SYNC_2 = 0x62
 
-    @classmethod
-    def CLASS_ID(cls):
-        return cls.CLASS, cls.ID
-
-    def __init__(self, cls, id, length=0, data=bytearray()):
+    def __init__(self, cls_msg_id, length=0, data=bytearray()):
         super().__init__()
-        self.cls = cls
-        self.id = id
+        self.cls_msg_id = cls_msg_id
         self.length = length
         self.data = data
         assert self.length == len(self.data)
         self._calc_checksum()
 
-    def is_class_id(self, cls, id):
-        return cls == self.cls and id == self.id
+    def matches(self, msg_type):
+        assert isinstance(msg_type, UbxMessage)
+
+        # msg_type.value is the ClsMsgId object behind the enum value
+        #   e.g. UbxMessage.ACK_ACK becomes ClsMsgId(0x05, 0x01)
+        return self.cls_msg_id == msg_type.value
 
     def to_bytes(self):
+        """
+        Returns binary represention of frame in wire format
+
+        Returned bytearray can be sent to modem
+        """
         msg = bytearray([UbxFrame.SYNC_1, UbxFrame.SYNC_2])
-        msg.append(self.cls)
-        msg.append(self.id)
+        msg.append(self.cls_msg_id.clsId)
+        msg.append(self.cls_msg_id.msgId)
         msg.append((self.length >> 0) % 0xFF)
         msg.append((self.length >> 8) % 0xFF)
         msg += self.data
@@ -50,10 +84,12 @@ class UbxFrame(object):
         return msg
 
     def _calc_checksum(self):
+        """
+        Computes checksum over frame and stores in object
+        """
         self._init_checksum()
-
-        self._add_checksum(self.cls)
-        self._add_checksum(self.id)
+        self._add_checksum(self.cls_msg_id.clsId)
+        self._add_checksum(self.cls_msg_id.msgId)
         self._add_checksum((self.length >> 0) & 0xFF)
         self._add_checksum((self.length >> 8) & 0xFF)
         for d in self.data:
@@ -70,7 +106,7 @@ class UbxFrame(object):
         self.ckb &= 0xFF
 
     def __str__(self):
-        return f'UBX: cls:{self.cls:02x} id:{self.id:02x} len:{self.length}'
+        return f'UBX: {self.cls_msg_id} len:{self.length}'
 
 
 class UbxPoll(UbxFrame):
@@ -78,45 +114,105 @@ class UbxPoll(UbxFrame):
     Base class for a polling frame.
 
     Create by specifying u-blox message class and id.
+    e.g. UbxPoll(UbxMessage.UPD_SOS)
     """
-    def __init__(self, cls, id):
-        super().__init__(cls, id)
+    def __init__(self, msg_type):
+        assert isinstance(msg_type, UbxMessage)
+
+        # msg_type.value is the ClsMsgId object behind the enum value
+        #   e.g. UbxMessage.ACK_ACK becomes ClsMsgId(0x05, 0x01)
+        super().__init__(msg_type.value)
+
+
+class UbxAckAck(UbxFrame):
+    def __init__(self, msg):
+        super().__init__(msg.cls_msg_id, msg.length, msg.data)
+        if msg.length == 2:
+            self.ack_clsID = msg.data[0]
+            self.ack_msgID = msg.data[1]
+        else:
+            self.ack_clsID = -1
+            self.ack_msgID = -1
+
+    def __str__(self):
+        return f'UBX-ACK-ACK: clsId:{self.ack_clsID}, msgId:{self.ack_msgID}'
+
+
+class UbxMonVer(UbxFrame):
+    """
+    UBX-MON-VER response
+    """
+    EXTENSION_SIZE = 30
+
+    def __init__(self, msg):
+        super().__init__(msg.cls_msg_id, msg.length, msg.data)
+        if msg.length >= 40:
+            self.swVersion = msg.data[0:29].decode()
+            self.hwVersion = msg.data[30:39].decode()
+            self.extension = []
+
+            remain = msg.length - 40
+            offset = 40
+            if remain % UbxMonVer.EXTENSION_SIZE == 0:
+                while remain > 0:
+                    ext = msg.data[offset:offset+UbxMonVer.EXTENSION_SIZE].decode()
+                    self.extension.append(ext)
+                    remain -= UbxMonVer.EXTENSION_SIZE
+                    offset += UbxMonVer.EXTENSION_SIZE
+
+            for t in self.extension:
+                print(t)
+
+    def __str__(self):
+        res = f'UBX-UPD-SOS:\nSW: {self.swVersion}\nHW: {self.hwVersion}'
+        for ext in self.extension:
+            res += '\n' + ext
+        return res
 
 
 class UbxUpdSos(UbxFrame):
-    CLASS = 0x09
-    ID = 0x14
-
+    """
+    UBX-UPD-SOS response
+    """
     def __init__(self, msg):
-        super().__init__(msg.cls, msg.id, msg.length, msg.data)
+        super().__init__(msg.cls_msg_id, msg.length, msg.data)
         if msg.length == 8 and msg.data[0] == 3:
             self.cmd = msg.data[0]
             self.response = msg.data[4]
+            # TODO: Validity check (0..3)
         else:
             self.cmd = -1
             self.response = -1
 
     def __str__(self):
-        return f'UBX-UPD-SOS: cmd:{self.cmd}, response:{self.response}'
+        resp_str = self._response_str()
+        return f'UBX-UPD-SOS: cmd:{self.cmd}, response:{self.response} ({resp_str})'
+
+    def _response_str(self):
+        resp_str = ['unknown', 'failed', 'restored', 'not restored (no backup)']
+        # TODO: Error check
+        return resp_str[self.response]
 
 
 class UbxUpdSosAction(UbxFrame):
-    CLASS = 0x09
-    ID = 0x14
+    """
+    UBX-UPD-SOS action
 
-    # msg_upd_sos_save = bytearray.fromhex('09 14 04 00 00 00 00 00')
-    # msg_upd_sos_clear = bytearray.fromhex('09 14 04 00 01 00 00 00')
+    action: 0 = create
+            1 = clear
+    """
     def __init__(self, action):
+        # TODO: build message depending on action parameter
         msg = bytearray.fromhex('01 00 00 00')
-        super().__init__(self.CLASS, self.ID, 4, msg)
+        super().__init__(UbxMessage.UPD_SOS.value, 4, msg)
 
 
 class UbxCfgTp5(UbxFrame):
-    CLASS = 0x06
-    ID = 0x31
-
+    """
+    UBX-CFG-TP5 response
+    """
     def __init__(self, msg):
-        super().__init__(msg.cls, msg.id, msg.length, msg.data)
+        super().__init__(msg.cls_msg_id, msg.length, msg.data)
         if msg.length == 32:
             tpIdx, version, res1, antCableDelay, rfGroupDelay = struct.unpack('BBhhh', msg.data[0:8])
             print(tpIdx, version, antCableDelay, rfGroupDelay)
@@ -166,14 +262,7 @@ class UbxParser(object):
 
         self.queue = queue
         self.state = __class__.State.init
-
-        self.msg_class = 0
-        self.msg_id = 0
-        self.msg_len = 0
-        self.msg_data = bytearray()
-        self.ofs = 0
-        self.cka = 0
-        self.ckb = 0
+        self._reset()
 
     def process(self, data):
         for d in data:
@@ -221,30 +310,40 @@ class UbxParser(object):
                 self.ckb = d
 
                 # Build frame from received data. This computes the checksum
-                # if checksum matches received checksum forward message to parser
-                frame = UbxFrame(self.msg_class, self.msg_id, self.msg_len, self.msg_data)
+                # if checksum matches received checksum forward message to
+                # parser for further dissection
+                cls_id = ClsMsgId(self.msg_class, self.msg_id)
+                frame = UbxFrame(cls_id, self.msg_len, self.msg_data)
+
                 if frame.cka == self.cka and frame.ckb == self.ckb:
-                    self.parse_frame(frame)
+                    self.parse_message(frame)
                 else:
                     logger.warning(f'checksum error in frame')
 
                 self._reset()
                 self.state = __class__.State.init
 
-    def parse_frame(self, ubx_frame):
-        if ubx_frame.is_class_id(0x09, 0x14):
-            # logger.debug(f'UBX-UPD-SOS: {binascii.hexlify(ubx_frame.to_bytes())}')
-            frame = UbxUpdSos(ubx_frame)
-        elif ubx_frame.is_class_id(0x06, 0x31):
-            # logger.debug(f'UBX-CFG-TP5: {binascii.hexlify(ubx_frame.to_bytes())}')
-            frame = UbxCfgTp5(ubx_frame)
+    def parse_message(self, frame):
+        if frame.matches(UbxMessage.ACK_ACK):
+            frame = UbxAckAck(frame)
+        elif frame.matches(UbxMessage.MON_VER):
+            frame = UbxMonVer(frame)
+        elif frame.matches(UbxMessage.UPD_SOS):
+            frame = UbxUpdSos(frame)
+        elif frame.matches(UbxMessage.CFG_TP5):
+            frame = UbxCfgTp5(frame)
         else:
             # If we can't parse the frame, return as is
-            frame = ubx_frame
+            frame = frame
+            # frame = None
 
-        self.queue.put(frame)
+        if frame:
+            self.queue.put(frame)
 
     def _reset(self):
+        """
+        Resets parser state for next frame
+        """
         self.msg_class = 0
         self.msg_id = 0
         self.msg_len = 0
@@ -271,8 +370,7 @@ class GnssUBlox(threading.Thread):
         self.thread_ready_event = threading.Event()
         self.thread_stop_event = threading.Event()
 
-        self.wait_msg_class = -1
-        self.wait_msg_id = -1
+        self.wait_cls_msg_id = None
 
     def setup(self):
         # Start worker thread in daemon mode, will invoke run() method
@@ -293,32 +391,40 @@ class GnssUBlox(threading.Thread):
         self.join(timeout=1.0)
         logger.info('thread stopped')
 
+    # High Level API
+
     def sos_state(self):
-        logger.debug('getting SOS state')
-        msg_upd_sos_poll = UbxPoll(*UbxUpdSos.CLASS_ID())
-        res = r.poll(msg_upd_sos_poll)
+        logger.debug('checking SOS restore state')
+        msg_upd_sos_poll = UbxPoll(UbxMessage.UPD_SOS)
+        res = self.poll(msg_upd_sos_poll)
         if res:
             return res.response
 
     def sos_create_backup(self):
-        pass
-
-    def sos_remove_backup(self):
-        logger.debug('removing state backup file')
+        logger.debug('creating state backup file')
 
         msg = UbxUpdSosAction(0)
         print(msg.to_bytes())
-
-        self.expect(0x05, 0x00)
+        self.expect(UbxMessage.ACK_ACK)
         self.send(msg)
-        self.wait()
+        res = self.wait()
+        print(res)
 
-#msg_upd_sos_save = bytearray.fromhex('09 14 04 00 00 00 00 00')
-#msg_upd_sos_clear = bytearray.fromhex('09 14 04 00 01 00 00 00')
+    def sos_clear_backup(self):
+        logger.debug('clearing state backup file')
+
+        msg = UbxUpdSosAction(1)
+        print(msg.to_bytes())
+        self.expect(UbxMessage.ACK_ACK)
+        self.send(msg)
+        res = self.wait()
+        print(res)
+
+    # Low Level API
 
     def poll(self, message):
         """
-        Poll a receiver status
+        Polls a receiver status
 
         - sends the specified poll message
         - waits for receiver message with same class/id as poll message
@@ -326,20 +432,27 @@ class GnssUBlox(threading.Thread):
         assert isinstance(message, UbxFrame)
         assert message.length == 0      # poll message have no payload
 
-        self.expect(message.cls, message.id)
+        self.expect(message.cls_msg_id)
         self.send(message)
         res = self.wait()
-
         return res
 
-    def expect(self, msg_class, msg_id):
+    def expect(self, cls_msg_id):
         """
-        Define message message to wait for
+        Defines message message to wait for
         """
-        self.wait_msg_class = msg_class
-        self.wait_msg_id = msg_id
+        logger.debug(f'preparing to wait for {cls_msg_id}')
+        self.wait_cls_msg_id = cls_msg_id
 
-    def send(self, ubx_message):
+    def send(self, message):
+        """
+        Sends binary message to GNSS modem
+
+        - opens connection to gpsd control socket (not data socket)
+        - creates control message in gpsd format (ASCII format)
+            "&/dev/ttyS3=b56201011234..."
+        - sends message and checks gpsd control daemon response
+        """
         try:
             self.control_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             self.control_sock.connect(GnssUBlox.gpsd_control_socket)
@@ -348,7 +461,7 @@ class GnssUBlox(threading.Thread):
             # data = sock.recv(512)
             # print(data.decode())
 
-            msg_in_binary = ubx_message.to_bytes()
+            msg_in_binary = message.to_bytes()
             msg_in_ascii = binascii.hexlify(msg_in_binary)
             # logger.debug(f'sending {msg_in_ascii}')
 
@@ -359,7 +472,7 @@ class GnssUBlox(threading.Thread):
             # checking for response (OK or ERROR)
             data = self.control_sock.recv(512)
             response = data.decode().strip()
-            logger.debug(f'response: {response}')
+            logger.debug(f'gpsd response: {response}')
 
             # TODO: check why we need to close socket here...
             self.control_sock.close()
@@ -368,6 +481,9 @@ class GnssUBlox(threading.Thread):
             logger.error(msg_in_ascii)
 
     def wait(self, timeout=3.0):
+        """
+        waits for message defined in expect() to arrive and returns it
+        """
         logger.debug(f'waiting {timeout}s for reponse from listener thread')
 
         time_end = time.time() + timeout
@@ -376,8 +492,9 @@ class GnssUBlox(threading.Thread):
                 res = self.response_queue.get(True, timeout)
                 logger.debug(f'got response {res}')
                 if isinstance(res, UbxFrame):
-                    if res.cls == self.wait_msg_class and res.id == self.wait_msg_id:
+                    if res.cls_msg_id == self.wait_cls_msg_id:
                         return res
+
             except queue.Empty:
                 logger.warning('timeout...')
 
@@ -403,12 +520,17 @@ class GnssUBlox(threading.Thread):
 
             logger.debug('receiver ready')
             self.thread_ready_event.set()
+            # ready = False
 
             while not self.thread_stop_event.is_set():
                 try:
                     data = self.listen_sock.recv(8192)
                     if data:
+                        # if not ready:
+                        #     self.thread_ready_event.set()
+                        #     ready = True
                         self.parser.process(data)
+
                 except socket.timeout:
                     pass
 
@@ -418,36 +540,41 @@ class GnssUBlox(threading.Thread):
         logger.debug('receiver done')
 
 
-msg_stop = bytearray.fromhex('06 04 04 00 00 00 08 00')    # stop
-msg_cold_start = bytearray.fromhex('06 04 04 00 FF FF 01 00')  # Cold Start
-msg_mon_ver = bytearray.fromhex('0A 04 00 00')  # MON-VER
-msg_cfg_port_poll = bytearray.fromhex('06 00 01 00 01')  # UBX-CFG-PRT poll
-msg_nav_status_poll = bytearray.fromhex('01 03 00 00')
+def main():
+    r = GnssUBlox('/dev/ttyS3')
+    r.setup()
+    # time.sleep(0.5)
 
-# msg_cfg_port_uart_9600 = bytearray.fromhex('06 00 14 00 01 00 00 00 c0 08 00 00 80 25 00 00 07 00 01 00 00 00 00 00')
-msg_cfg_port_uart_115200 = bytearray.fromhex('06 00 14 00 01 00 00 00 c0 08 00 00 00 c2 01 00 07 00 01 00 00 00 00 00')
+    # r.sos_clear_backup()
+    # response = r.sos_state()
+    # if response:
+    #     print(f'SOS state is {response}')
 
-msg_upd_sos_save = bytearray.fromhex('09 14 04 00 00 00 00 00')
-msg_upd_sos_clear = bytearray.fromhex('09 14 04 00 01 00 00 00')
+    msg = UbxPoll(UbxMessage.MON_VER)
+    r.poll(msg)
+    # print(res)
 
-r = GnssUBlox('/dev/ttyS3')
-r.setup()
+    msg_upd_tp5_poll = UbxPoll(UbxMessage.CFG_TP5)
+    res = r.poll(msg_upd_tp5_poll)
+    # print(res)
+    # quit()
 
-r.sos_remove_backup()
-#quit()
+    for i in range(0, 1):
+        print(f'***** {i} ***********************')
+        response = r.sos_state()
+        if response:
+            print(f'SOS state is {response}')
+        else:
+            print('no reponse')
 
-for i in range(0, 1):
-    print(f'***** {i} ***********************')
-    response = r.sos_state()
-    if response:
-        print(f'SOS state is {response}')
+        # msg_upd_tp5_poll = UbxFrame(*UbxCfgTp5.CLASS_ID())
+        # res = r.poll(msg_upd_tp5_poll)
+        # print(res)
 
-    #msg_upd_tp5_poll = UbxFrame(*UbxCfgTp5.CLASS_ID())
-    #res = r.poll(msg_upd_tp5_poll)
-    #print(res)
+        time.sleep(0.87)
 
-    time.sleep(0.87)
-
-r.cleanup()
+    r.cleanup()
 
 
+if __name__ == "__main__":
+    main()
